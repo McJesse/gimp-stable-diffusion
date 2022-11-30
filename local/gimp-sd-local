@@ -1,0 +1,270 @@
+#!/usr/bin/python
+
+# v1.1.0
+
+import urllib2
+import tempfile
+import os
+import base64
+import json
+import re
+import random
+import math
+import gimp
+import time
+from gimpfu import *
+
+VERSION = 110
+INIT_FILE = "init.png"
+MASK_FILE = "mask.png"
+GENERATED_FILE = "generated.png"
+API_ENDPOINT = "render"
+API_VERSION = 5
+
+initFile = r"{}".format(os.path.join(tempfile.gettempdir(), INIT_FILE))
+maskFile = r"{}".format(os.path.join(tempfile.gettempdir(), MASK_FILE))
+generatedFile = r"{}".format(os.path.join(tempfile.gettempdir(), GENERATED_FILE))
+
+def checkUpdate():
+  try:
+     gimp.get_data("update_checked")
+     updateChecked = True
+  except Exception as ex:
+     updateChecked = False
+  if updateChecked is False:
+     try:
+        url = "https://raw.githubusercontent.com/blueturtleai/gimp-stable-diffusion/main/local/version.json"
+        response = urllib2.urlopen(url)
+        data = response.read()
+        data = json.loads(data)
+        gimp.set_data("update_checked", "1")
+        if VERSION < int(data["version"]):
+           pdb.gimp_message(data["message"])
+     except Exception as ex:
+        ex = ex
+
+def cleanup():
+   try:
+      if os.path.exists(initFile):
+         os.remove(initFile)
+      if os.path.exists(maskFile):
+         os.remove(maskFile)
+      if os.path.exists(generatedFile):
+         os.remove(generatedFile)
+   except Exception as ex:
+      ex = ex
+
+def getImages(data, seed):
+   images = []
+   #for counter in range(len(data["data"])):
+   #   image = re.match("data:image/png;base64,(.*)", data["data"][counter]).group(1)
+   #   image = {"img": image, "seed": seed}
+   #   images.append(image)
+   image = re.match("data:image/png;base64,(.*)", data["data"]).group(1)
+   image = {"img": image, "seed": seed}
+   images.append(image)
+   return images
+
+
+def getImageData(image, drawable):
+   pdb.file_png_save_defaults(image, drawable.image.active_layer, initFile, initFile)
+   initImage = open(initFile, "rb")
+   encoded = base64.b64encode(initImage.read())
+   return encoded
+
+def getMaskData(image, drawable):
+   #image.disable_undo()
+   image.undo_freeze()
+   pdb.plug_in_vinvert(image, drawable)
+   pdb.file_png_save_defaults(image, drawable, maskFile, maskFile)
+   pdb.plug_in_vinvert(image, drawable)
+   image.undo_thaw()
+   #image.enable_undo()
+   maskImage = open(maskFile, "rb")
+   mask = maskImage.read()
+   #mask = Image_Inversion(mask)
+   encoded = base64.b64encode(mask)
+   return encoded
+   
+def displayGenerated(images):
+   #color = pdb.gimp_context_get_foreground()
+   #pdb.gimp_context_set_foreground((0, 0, 0))
+   for image in images:
+      imageFile = open(generatedFile, "wb+")
+      imageFile.write(base64.b64decode(image["img"]))
+      imageFile.close()
+      imageLoaded = pdb.file_png_load(generatedFile, generatedFile)
+      imageLoaded.filename = r"generated-seed-" + str(image["seed"])
+      pdb.gimp_display_new(imageLoaded)
+      # image, drawable, x, y, text, border, antialias, size, size_type, fontname
+      #pdb.gimp_text_fontname(imageLoaded, None, 2, 2, str(image["seed"]), -1, TRUE, 12, 1, "Sans")
+      #pdb.gimp_image_set_active_layer(imageLoaded, imageLoaded.layers[1])
+   #pdb.gimp_context_set_foreground(color)
+   return
+
+def generate(image, drawable, mode, prompt, negativePrompt, seed, imageCount, guidanceScale, promptStrength, steps, model, vae, sampler, faceCorrect, upscale, url, serverTimeout):
+   #drawable=subimage.active_layer
+   if image.width < 384 or image.width > 1024 or image.height < 384 or image.height > 1024:
+      raise Exception("Invalid image size. Image needs to be between 384x384 and 1024x1024.")
+   if image.width * image.height > 786432:
+      raise Exception("Invalid image size. Maximum size is 1024x768 or 768x1024.")
+   if prompt == "":
+      raise Exception("Please enter a prompt.")
+   if mode == "MODE_INPAINTING" and drawable.has_alpha == 0 and drawable.is_layer_mask == 0:
+      raise Exception("Invalid image. For inpainting an alpha channel is needed and an active mask with white and transparent.")
+   pdb.gimp_progress_init("", None)
+   input = {
+      "mode": mode,
+      "prompt": prompt,
+      "negative_prompt": negativePrompt,
+      "guidance_scale": float(guidanceScale),
+      "prompt_strength": float(promptStrength),
+      "num_inference_steps": int(steps),
+      "sampler": sampler,
+      "image_count": int(imageCount),
+      #"allow_nsfw": True,
+      #"api_version": API_VERSION,
+      "use_stable_diffusion_model": model,
+      "use_vae_model": vae,
+      "use_face_correction": faceCorrect,
+      "output_format": "png",
+      "show_only_filtered_image": True,
+      "stream_progress_updates": False,
+      "stream_image_progress": False,
+   }
+   if image.width % 64 != 0:
+      width = math.floor(image.width/64) * 64
+   else:
+      width = image.width
+   if image.height % 64 != 0:
+      height = math.floor(image.height/64) * 64
+   else:
+      height = image.height
+   input.update({"width": int(width)})
+   input.update({"height": int(height)})
+   if not seed:
+      seed = random.randint(0, 2**31)
+   else:
+      seed = int(seed)
+   input.update({"seed": seed})
+   if mode == "MODE_IMG2IMG" or mode == "MODE_INPAINTING":
+      imageData = getImageData(image, drawable)
+      #image = image.open(io.BytesIO(base64.b64decode((image))))
+      imageData = "data:image/png;base64, " + imageData
+      input.update({"init_image": imageData})
+      #input.update({"prompt_strength": (1 - float(guidanceScale))})
+   if mode == "MODE_INPAINTING":
+      maskData = getMaskData(image, drawable)
+      maskData = "data:image/png;base64, " + maskData
+      input.update({"mask": maskData})
+   #data = {"input": input}
+   #data = json.dumps(data)
+   data = json.dumps(input)
+   headers = {"Content-Type": "application/json", "Accept": "application/json"}
+   url = url if not re.match(".*/$", url) else url[:-1]
+   #url = url + "/" if not re.match(".*/$", url) else url
+   #url = url + API_ENDPOINT
+   request = urllib2.Request(url=url + "/" + API_ENDPOINT, data=data, headers=headers)
+   pdb.gimp_progress_set_text("starting dreaming now...")
+   
+   
+   try:
+      response = urllib2.urlopen(request)
+      data = response.read()
+      ###raise Exception(data)
+      try:
+         data = json.loads(data)
+      except Exception as ex:
+         raise Exception(data)
+      if data["status"] == "failed":
+         raise Exception("The image couldn't be generated: " + data["error"])
+      #raise Exception(url + data["stream"])
+     
+      if data["status"] == "Online" or data["status"] == "Rendering":
+         ###raise Exception(url + data["stream"])
+         request = urllib2.Request(url=url + data["stream"], headers=headers)
+         start = time.time()
+         while True:
+            try:
+                if time.time() - start > serverTimeout:
+                    raise Exception("Server took too long")
+                time.sleep(1)
+                response = urllib2.urlopen(request)
+                break
+            except Exception as ex:
+                s = str(ex)
+                if re.match(".*[425].*", s):    #too soon
+                    time.sleep(2)
+                else:
+                    raise ex
+         data = "..."
+         while not data[-3:] == "}]}":
+            if time.time() - start > serverTimeout:
+                raise Exception("Server took too long")
+            time.sleep(1)
+            response = urllib2.urlopen(request)
+            data = response.read()
+            m = re.search("\"status\":\s*\"([^\"]*)\"", data)
+            if m:
+                if m.group(1) == "succeeded":
+                    break
+                else:
+                    raise Exception("Data from server corrupt.")
+                    ###raise Exception(imageData[:25]+"   "+imageData[-25:]+"  "+str(len(imageData))+"  "+str(len(imageData)%4))
+         m = re.search("(\{[^\{]*\[(\{.*})])}$", data)
+         if m:
+            data = m.group(2)
+         else:
+            raise Exception("No match in data retreived")
+         data = json.loads(data)
+      else:
+         raise Exception("The Server status: "+data["status"])
+      images = getImages(data, seed)
+      displayGenerated(images)
+   except Exception as ex:
+      raise ex
+   finally:
+      pdb.gimp_progress_end()
+      cleanup()
+      ###checkUpdate()
+   return
+
+register(
+   "stable-local",
+   "stable-local",
+   "stable-local",
+   "BlueTurtleAI",
+   "BlueTurtleAI",
+   "2022",
+   "<Image>/AI/Stable Local",
+   "*",
+   [
+      (PF_RADIO, "mode", "Generation Mode", "MODE_TEXT2IMG", (
+         ("Text -> Image", "MODE_TEXT2IMG"),
+         ("Image -> Image", "MODE_IMG2IMG"),
+         ("Inpainting", "MODE_INPAINTING")
+      )),
+      (PF_STRING, "prompt", "Prompt", "i dream of a..."),
+      (PF_STRING, "negativePrompt", "Negative Prompt", ""),
+      (PF_STRING, "seed", "Seed (optional)", ""),
+      (PF_SLIDER, "imageCount", "Number of images", 1, (1, 1, 1)),
+      (PF_SLIDER, "guidanceScale", "Guidance Scale", 7.5, (0.0, 50.0, 0.1)),
+      (PF_SLIDER, "promptStrength", "Prompt Strength", 0.5, (0, 1.0, 0.01)),
+      (PF_SLIDER, "steps", "Steps", 25, (1, 150, 1)),
+      (PF_STRING, "model", "Model", "sd-v1-4"),
+      (PF_STRING, "vae", "Vae", ""),
+      (PF_STRING, "sampler", "Sampler", "ddim"),
+      (PF_TOGGLE, "faceCorrect", "Face correct with GFPGAN", True),
+      (PF_RADIO, "upscale", "Upscale", "", (
+         ("None", ""),
+         ("RealESRGAN_x4pluse", "RealESRGAN_x4plus"),
+         ("RealESRGAN_x4plus_anime_6B", "RealESRGAN_x4plus_anime_6B")
+      )),
+      (PF_STRING, "url", "Backend root URL", "http://127.0.0.1:9000/"),
+      (PF_SLIDER, "serverTimeout", "Server Timeout", 30, (1, 120, 1))
+   ],
+   [],
+   generate
+)
+
+main()
